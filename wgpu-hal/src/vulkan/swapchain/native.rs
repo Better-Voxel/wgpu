@@ -468,10 +468,31 @@ impl Swapchain for NativeSwapchain {
         // acquire.
         unsafe {
             // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
-            self.device
-                .raw
-                .wait_for_fences(&[self.fence], true, timeout_ns)
-                .map_err(map_host_device_oom_and_lost_err)?;
+            //
+            // A `VK_TIMEOUT` from this wait is not a device loss
+            // (https://github.com/gfx-rs/wgpu/issues/9029): the image is
+            // acquired and its fence is merely still pending — a stalled
+            // compositor holds it past the timeout on Windows. The only sound
+            // thing to do is to keep waiting; a device that is really gone
+            // answers `ERROR_DEVICE_LOST` here, which maps as before.
+            let mut waited_ns: u64 = 0;
+            loop {
+                match self
+                    .device
+                    .raw
+                    .wait_for_fences(&[self.fence], true, timeout_ns)
+                {
+                    Ok(()) => break,
+                    Err(vk::Result::TIMEOUT) => {
+                        waited_ns = waited_ns.saturating_add(timeout_ns);
+                        log::warn!(
+                            "the swapchain's acquire fence is still pending after {} ms; waiting on",
+                            waited_ns / 1_000_000
+                        );
+                    }
+                    Err(other) => return Err(map_host_device_oom_and_lost_err(other).into()),
+                }
+            }
 
             self.device
                 .raw
