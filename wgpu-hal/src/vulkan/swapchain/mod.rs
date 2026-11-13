@@ -57,6 +57,10 @@ pub(super) trait Swapchain: Send + Sync + 'static {
     /// destroying the swapchain itself. Must be called before calling
     /// either [`Surface::create_swapchain`] or dropping the swapchain.
     ///
+    /// A swapchain released with an acquire still pending (see
+    /// [`Swapchain::acquire`]) keeps that acquire's fence and acquire semaphore
+    /// until it is dropped, and destroys them after the swapchain.
+    ///
     /// The swapchain must not be in use when this is called.
     unsafe fn release_resources(&mut self, device: &super::Device);
 
@@ -66,6 +70,13 @@ pub(super) trait Swapchain: Send + Sync + 'static {
     /// If `None` is specified, this function will wait indefinitely.
     ///
     /// Returns `Err(SurfaceError::Timeout)` if the timeout elapsed before an image became available.
+    ///
+    /// A swapchain that waits on an acquire fence (the native swapchain, on
+    /// Windows) bounds that wait whatever `timeout` is: once one call has waited
+    /// `ACQUIRE_FENCE_BOUND` on it, the call returns `Err(SurfaceError::Outdated)`
+    /// and the acquire stays pending, resumed by the next call. A call given a
+    /// zero `timeout` that finds the fence pending returns
+    /// `Err(SurfaceError::Timeout)`, never `Outdated`.
     unsafe fn acquire(
         &mut self,
         timeout: Option<Duration>,

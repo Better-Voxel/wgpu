@@ -706,6 +706,9 @@ pub trait Surface: WasmNotSendSync {
     /// If `timeout` elapses before `self` has a texture ready to be acquired,
     /// return `Err(SurfaceError::Timeout)`. If `timeout` is `None`, wait
     /// indefinitely, with no timeout.
+    /// The Vulkan backend, on Windows, bounds its wait on the swapchain's acquire
+    /// fence to `ACQUIRE_FENCE_BOUND` per call, whatever `timeout` is, and
+    /// returns `Err(SurfaceError::Outdated)` past it.
     ///
     /// # Using an [`AcquiredSurfaceTexture`]
     ///

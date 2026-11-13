@@ -317,9 +317,14 @@ impl Surface for NativeSurface {
 /// How long one [`Swapchain::acquire`] waits for the swapchain's acquire fence
 /// before it gives the swapchain up as outdated.
 ///
+/// The wait is counted in whole slices of the caller's timeout,
+/// [`ACQUIRE_FENCE_SLICE`] at most: a call gives up once the slices that timed
+/// out add up to the bound, so a caller that gives 400 ms gives up after eight
+/// slices, 3.2 s.
+///
 /// Long enough for a stalled compositor to hand the image back
-/// (https://github.com/gfx-rs/wgpu/issues/9029); short enough that a fence that
-/// never signals costs a hitch rather than a hang.
+/// (<https://github.com/gfx-rs/wgpu/issues/9029>); short enough that a fence
+/// that never signals costs a hitch rather than a hang.
 const ACQUIRE_FENCE_BOUND: Duration = Duration::from_secs(3);
 
 /// The longest single wait on the swapchain's acquire fence; each one that
@@ -410,8 +415,10 @@ impl Drop for NativeSwapchain {
         unsafe {
             self.functor.destroy_swapchain(self.raw, None);
         }
-        // What an acquire still held at `release_resources` outlives the
-        // swapchain it was acquired from; see there.
+        // What an acquire still held at `release_resources` is destroyed after
+        // the swapchain it was acquired from. That the presentation engine is
+        // done with it by then is assumed, not stated by the specification; see
+        // there.
         if let Some((fence, semaphore)) = self.kept_for_pending_acquire.take() {
             unsafe {
                 self.device.raw.destroy_fence(fence, None);
@@ -440,14 +447,25 @@ impl Swapchain for NativeSwapchain {
         if let Some(fence) = self.fence {
             if self.pending_acquire.is_some() {
                 // An acquire still pending holds the fence and its acquire
-                // semaphore: once the image is acquired their signal operations
-                // "are submitted for execution", and "Applications must not free
-                // or destroy any object while it is being accessed".
-                // `vkDeviceWaitIdle` above waits for queue work alone, and the
-                // destroy commands' own rules (VUID-vkDestroyFence-fence-01120,
-                // VUID-vkDestroySemaphore-semaphore-05149) name queue work only,
-                // so both are kept until the swapchain itself is destroyed, in
-                // `Drop`. The image needs nothing: no use of it was submitted
+                // semaphore. Once the image is acquired their signal operations
+                // "are submitted for execution" (the description of
+                // `vkAcquireNextImageKHR`), and "Applications must not free or
+                // destroy any object while it is being accessed" (Fundamentals,
+                // Object Lifetime). `vkDeviceWaitIdle` above waits for queue work
+                // alone, and the destroy commands' own rules
+                // (VUID-vkDestroyFence-fence-01120,
+                // VUID-vkDestroySemaphore-semaphore-05149) name queue work only.
+                //
+                // Both are kept and destroyed in `Drop`, after the swapchain: the
+                // latest point this code controls. That the presentation engine
+                // is done with them by then is assumed, not stated: the
+                // specification does not say whether `vkDestroySwapchainKHR` ends
+                // an acquire's pending signal operations, and no valid-usage
+                // statement makes their destruction valid there. The alternative,
+                // never destroying them, leaks one fence and one semaphore per
+                // swapchain given up, and is not taken.
+                //
+                // The image needs nothing: no use of it was submitted
                 // (VUID-vkDestroySwapchainKHR-swapchain-01282: "All uses of
                 // presentable images acquired from swapchain must have completed
                 // execution").
@@ -594,7 +612,8 @@ impl Swapchain for NativeSwapchain {
                 // `ACQUIRE_FENCE_BOUND` of waiting in one call the swapchain is
                 // given up as outdated, which a caller answers by making it
                 // again; a device that is really gone answers
-                // `ERROR_DEVICE_LOST` here, which maps as before.
+                // `ERROR_DEVICE_LOST` here, which is returned as
+                // `SurfaceError::Device(DeviceError::Lost)`.
                 loop {
                     match self
                         .device
@@ -603,7 +622,9 @@ impl Swapchain for NativeSwapchain {
                     {
                         Ok(()) => break,
                         // A caller that gives no time to wait is answered as a
-                        // timed-out acquire is; the acquire stays pending.
+                        // timed-out acquire is; the acquire stays pending. Such a
+                        // caller is never answered `Outdated`, by design: it
+                        // asked not to wait.
                         Err(vk::Result::TIMEOUT) if slice.is_zero() => {
                             return Err(crate::SurfaceError::Timeout);
                         }
