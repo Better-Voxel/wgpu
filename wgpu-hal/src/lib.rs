@@ -676,9 +676,9 @@ pub trait Surface: WasmNotSendSync {
     /// Configure `self` to use `device`.
     ///
     /// On the Vulkan backend, on Windows, a configure that replaces a swapchain an
-    /// acquire gave up as outdated (see [`Surface::acquire_texture`]) waits
-    /// `PRESENT_DRAIN` (100 ms), destroys that swapchain and makes the new one from
-    /// nothing; the surface has no swapchain between the two.
+    /// acquire gave up as outdated (see [`Surface::acquire_texture`]) destroys that
+    /// swapchain and makes the new one from nothing; the surface has no swapchain
+    /// between the two.
     ///
     /// # Safety
     ///
@@ -696,9 +696,14 @@ pub trait Surface: WasmNotSendSync {
     ///
     /// The Vulkan backend destroys the swapchain at once. On Windows, with vsync'd
     /// presents, a swapchain destroyed while one of its presents is still queued has
-    /// been seen to leave other surfaces' acquire fences pending, so a caller that
-    /// closes a window presents nothing to its surface for a moment (a tenth of a
-    /// second covers two queued frames at 30 Hz) before it unconfigures or drops it.
+    /// been seen to leave other surfaces' acquire fences pending: on a 240 Hz display,
+    /// of 250 closes whose swapchain was destroyed 20 ms or more after the last present
+    /// to it none was followed by such a stall, and of 126 whose swapchain was
+    /// destroyed 8 ms after it one was. So a caller that closes a window presents
+    /// nothing to its surface for a moment before it unconfigures or drops it. A tenth
+    /// of a second is a margin over those 20 ms, and would cover two queued frames
+    /// leaving the queue at 30 Hz (67 ms), if the queue's draining is what the 20 ms
+    /// stand for.
     ///
     /// # Safety
     ///

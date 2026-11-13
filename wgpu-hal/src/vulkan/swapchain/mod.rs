@@ -35,9 +35,9 @@ pub(super) trait Surface: Send + Sync + 'static {
     /// before calling this method.
     ///
     /// The old swapchain is provided even when an acquire gave it up as outdated (see
-    /// [`Swapchain::acquire`]). For such a swapchain the native surface waits `PRESENT_DRAIN`
-    /// (100 ms), destroys it and makes the new one from nothing, with no `oldSwapchain`;
-    /// the surface has no swapchain between the two. The reason is an observed one, not a
+    /// [`Swapchain::acquire`]). For such a swapchain the native surface destroys it and
+    /// makes the new one from nothing, with no `oldSwapchain`; the surface has no
+    /// swapchain between the two. The reason is an observed one, not a
     /// rule of Vulkan: on Windows, with vsync'd presents, a successor made with the
     /// given-up swapchain as `oldSwapchain` has been seen to stall as it did, and one made
     /// from nothing to acquire on.

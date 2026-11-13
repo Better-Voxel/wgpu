@@ -213,17 +213,9 @@ impl Surface for NativeSurface {
             // `vkDestroySwapchainKHR`). `release_resources` has run on it (the
             // trait's contract); dropping the box destroys the swapchain and
             // then what its pending acquire still held, as `unconfigure` does.
-            //
-            // The wait before the destroy covers one case (see `PRESENT_DRAIN`):
-            // a give-up whose cause was the device's own backlog, a frame whose
-            // rendering outlasted the bound, where the presents were waiting on
-            // that rendering and have entered the presentation queue only now
-            // that `release_resources` has waited the device idle. A give-up is
-            // rare and has already cost seconds.
             log::debug!(
                 "the swapchain given up as outdated is destroyed before its successor is made, with no old swapchain"
             );
-            std::thread::sleep(PRESENT_DRAIN);
             drop(provided_old_swapchain.take());
         }
 
@@ -370,27 +362,6 @@ const ACQUIRE_FENCE_BOUND: Duration = Duration::from_secs(3);
 /// The longest single wait on the swapchain's acquire fence; each one that
 /// times out is logged.
 const ACQUIRE_FENCE_SLICE: Duration = Duration::from_secs(1);
-
-/// How long a swapchain given up as outdated is kept, once
-/// [`Swapchain::release_resources`] has waited the device idle, before it is
-/// destroyed.
-///
-/// A swapchain is given up only after one call waited [`ACQUIRE_FENCE_BOUND`],
-/// and a caller that holds one surface texture at a time has presented nothing
-/// to it since, so its last `vkQueuePresentKHR` is at least that old when it
-/// is destroyed. The wait covers one case: a give-up whose cause was the
-/// device's own backlog, a frame whose rendering outlasted the bound, where the
-/// presents were still waiting on that rendering and reach the presentation
-/// queue only once `release_resources` has waited the device idle.
-///
-/// On Windows, with vsync'd presents, a swapchain destroyed while one of its
-/// presents was still queued has been seen to leave another swapchain's next
-/// acquire fence pending for good. On a 240 Hz display, 250 destroys made
-/// 20 ms or more after the window's last frame were followed by no such stall,
-/// 126 made 8 ms after it by one. Two queued frames take 8.3 ms to leave the
-/// queue at 240 Hz, 33 ms at 60 Hz and 67 ms at 30 Hz; the wait covers the
-/// last with room.
-const PRESENT_DRAIN: Duration = Duration::from_millis(100);
 
 /// An image [`vkAcquireNextImageKHR`] handed out whose acquire fence has not
 /// been seen signaled.
