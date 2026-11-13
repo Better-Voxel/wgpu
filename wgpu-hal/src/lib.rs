@@ -675,6 +675,11 @@ pub trait Surface: WasmNotSendSync {
 
     /// Configure `self` to use `device`.
     ///
+    /// On the Vulkan backend, on Windows, a configure that replaces a swapchain an
+    /// acquire gave up as outdated (see [`Surface::acquire_texture`]) waits
+    /// `PRESENT_DRAIN` (100 ms), destroys that swapchain and makes the new one from
+    /// nothing; the surface has no swapchain between the two.
+    ///
     /// # Safety
     ///
     /// - All GPU work using `self` must have been completed.
@@ -688,6 +693,12 @@ pub trait Surface: WasmNotSendSync {
     ) -> Result<(), SurfaceError>;
 
     /// Unconfigure `self` on `device`.
+    ///
+    /// The Vulkan backend destroys the swapchain at once. On Windows, with vsync'd
+    /// presents, a swapchain destroyed while one of its presents is still queued has
+    /// been seen to leave other surfaces' acquire fences pending, so a caller that
+    /// closes a window presents nothing to its surface for a moment (a tenth of a
+    /// second covers two queued frames at 30 Hz) before it unconfigures or drops it.
     ///
     /// # Safety
     ///
@@ -708,7 +719,9 @@ pub trait Surface: WasmNotSendSync {
     /// indefinitely, with no timeout.
     /// The Vulkan backend, on Windows, bounds its wait on the swapchain's acquire
     /// fence to `ACQUIRE_FENCE_BOUND` per call, whatever `timeout` is, and
-    /// returns `Err(SurfaceError::Outdated)` past it.
+    /// returns `Err(SurfaceError::Outdated)` past it; a call given a zero
+    /// `timeout` that finds the fence pending returns `Err(SurfaceError::Timeout)`
+    /// instead, never `Outdated`.
     ///
     /// # Using an [`AcquiredSurfaceTexture`]
     ///

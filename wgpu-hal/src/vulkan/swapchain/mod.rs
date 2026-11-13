@@ -35,9 +35,12 @@ pub(super) trait Surface: Send + Sync + 'static {
     /// before calling this method.
     ///
     /// The old swapchain is provided even when an acquire gave it up as outdated (see
-    /// [`Swapchain::acquire`]): such a swapchain is destroyed first and the new one made
-    /// from nothing, with no `oldSwapchain`, as the state that keeps its acquire fence
-    /// pending passes along `oldSwapchain` to the swapchain made from it.
+    /// [`Swapchain::acquire`]). For such a swapchain the native surface waits `PRESENT_DRAIN`
+    /// (100 ms), destroys it and makes the new one from nothing, with no `oldSwapchain`;
+    /// the surface has no swapchain between the two. The reason is an observed one, not a
+    /// rule of Vulkan: on Windows, with vsync'd presents, a successor made with the
+    /// given-up swapchain as `oldSwapchain` has been seen to stall as it did, and one made
+    /// from nothing to acquire on.
     unsafe fn create_swapchain(
         &self,
         device: &super::Device,
@@ -81,7 +84,10 @@ pub(super) trait Swapchain: Send + Sync + 'static {
     /// `ACQUIRE_FENCE_BOUND` on it, the call returns `Err(SurfaceError::Outdated)`
     /// and the acquire stays pending, resumed by the next call. A call given a
     /// zero `timeout` that finds the fence pending returns
-    /// `Err(SurfaceError::Timeout)`, never `Outdated`.
+    /// `Err(SurfaceError::Timeout)`, never `Outdated`, and gives nothing up: a
+    /// caller that only ever gives a zero `timeout` never has its swapchain given
+    /// up, so if it configures the surface again the swapchain, its acquire still
+    /// pending, is handed over as `oldSwapchain` like any other.
     unsafe fn acquire(
         &mut self,
         timeout: Option<Duration>,
