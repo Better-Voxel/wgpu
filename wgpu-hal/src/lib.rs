@@ -695,15 +695,17 @@ pub trait Surface: WasmNotSendSync {
     /// Unconfigure `self` on `device`.
     ///
     /// The Vulkan backend destroys the swapchain at once. On Windows, with vsync'd
-    /// presents, a swapchain destroyed while one of its presents is still queued has
-    /// been seen to leave other surfaces' acquire fences pending: on a 240 Hz display,
-    /// of 250 closes whose swapchain was destroyed 20 ms or more after the last present
-    /// to it none was followed by such a stall, and of 126 whose swapchain was
-    /// destroyed 8 ms after it one was. So a caller that closes a window presents
-    /// nothing to its surface for a moment before it unconfigures or drops it. A tenth
-    /// of a second is a margin over those 20 ms, and would cover two queued frames
-    /// leaving the queue at 30 Hz (67 ms), if the queue's draining is what the 20 ms
-    /// stand for.
+    /// presents on fast frames, a swapchain destroyed within a few milliseconds of the
+    /// last present to it has been seen to leave other surfaces' acquire fences
+    /// pending: on a 240 Hz display, of 250 closes whose swapchain was destroyed 20 ms
+    /// or more after the last present to it none was followed by such a stall, and of
+    /// 126 whose swapchain was destroyed 8 ms after it one was. With GPU-bound frames
+    /// of 120 ms and more, where the swapchain is destroyed right after the device was
+    /// waited idle, such a stall was not met in 68 closes. So a caller that closes a
+    /// window presents nothing to its surface for a moment before it unconfigures or
+    /// drops it. A tenth of a second is a margin over those 20 ms, and would cover two
+    /// queued frames leaving the queue at 30 Hz (67 ms), if the queue's draining is
+    /// what the 20 ms stand for.
     ///
     /// # Safety
     ///
