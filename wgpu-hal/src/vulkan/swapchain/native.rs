@@ -183,10 +183,46 @@ impl Surface for NativeSurface {
         &self,
         device: &crate::vulkan::Device,
         config: &crate::SurfaceConfiguration,
-        provided_old_swapchain: Option<Box<dyn Swapchain>>,
+        mut provided_old_swapchain: Option<Box<dyn Swapchain>>,
     ) -> Result<Box<dyn Swapchain>, crate::SurfaceError> {
         profiling::scope!("Device::create_swapchain");
         let functor = khr::swapchain::Device::new(&self.instance.raw, &device.shared.raw);
+
+        let old_given_up = provided_old_swapchain.as_ref().is_some_and(|osc| {
+            osc.as_any()
+                .downcast_ref::<NativeSwapchain>()
+                .unwrap()
+                .given_up
+        });
+        if old_given_up {
+            // A swapchain an acquire gave up as outdated is destroyed before its
+            // successor is made, and the successor is made with no old
+            // swapchain: one made with it as `oldSwapchain` stalls as it did,
+            // its second acquire's fence pending as well, give-up after
+            // give-up, where one made from nothing acquires on.
+            //
+            // The destroy comes first: "If oldSwapchain is VK_NULL_HANDLE, and
+            // the native window referred to by pCreateInfo->surface is already
+            // associated with a Vulkan swapchain,
+            // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR must be returned" (the
+            // description of `vkCreateSwapchainKHR`), and "Destroying the
+            // swapchain does not invalidate the parent VkSurfaceKHR, and a new
+            // swapchain can be created with it" (the description of
+            // `vkDestroySwapchainKHR`). `release_resources` has run on it (the
+            // trait's contract); dropping the box destroys the swapchain and
+            // then what its pending acquire still held, as `unconfigure` does.
+            //
+            // `release_resources` has just waited for the device to be idle, so
+            // a present that was waiting on its frame's rendering may have
+            // entered the presentation queue only now: the destroy waits
+            // `PRESENT_DRAIN` first. A give-up is rare and has already cost
+            // seconds.
+            log::debug!(
+                "the swapchain given up as outdated is destroyed before its successor is made, with no old swapchain"
+            );
+            std::thread::sleep(PRESENT_DRAIN);
+            drop(provided_old_swapchain.take());
+        }
 
         let old_swapchain = provided_old_swapchain
             .as_ref()
@@ -296,6 +332,7 @@ impl Surface for NativeSurface {
             fence,
             pending_acquire: None,
             kept_for_pending_acquire: None,
+            given_up: false,
             config: config.clone(),
             acquire_semaphores,
             next_acquire_index: 0,
@@ -331,6 +368,17 @@ const ACQUIRE_FENCE_BOUND: Duration = Duration::from_secs(3);
 /// times out is logged.
 const ACQUIRE_FENCE_SLICE: Duration = Duration::from_secs(1);
 
+/// How long a swapchain given up as outdated is kept before it is destroyed,
+/// for the presents still queued on it to leave the presentation queue.
+///
+/// Destroying a swapchain while one of its presents is still queued is what
+/// leaves another swapchain's next acquire fence pending for good: 250
+/// destroys made 20 ms or more after the window's last frame were followed by
+/// no such stall, 126 made 8 ms after it by one. Two queued frames take 8.3 ms
+/// to leave the queue at 240 Hz, 33 ms at 60 Hz and 67 ms at 30 Hz; the wait
+/// covers the last with room.
+const PRESENT_DRAIN: Duration = Duration::from_millis(100);
+
 /// An image [`vkAcquireNextImageKHR`] handed out whose acquire fence has not
 /// been seen signaled.
 ///
@@ -362,6 +410,11 @@ pub(crate) struct NativeSwapchain {
     /// [`Swapchain::release_resources`] ran, destroyed in `Drop` after the
     /// swapchain.
     kept_for_pending_acquire: Option<(vk::Fence, vk::Semaphore)>,
+    /// Whether a call to [`Swapchain::acquire`] gave this swapchain up as
+    /// outdated and no acquire has completed on it since;
+    /// [`Surface::create_swapchain`] destroys such a swapchain before it makes
+    /// its successor.
+    given_up: bool,
     config: crate::SurfaceConfiguration,
 
     /// Semaphores used between image acquisition and the first submission
@@ -636,6 +689,7 @@ impl Swapchain for NativeSwapchain {
                                     "the swapchain's acquire fence is still pending after {} ms; giving the swapchain up as outdated",
                                     pending.waited.as_millis()
                                 );
+                                self.given_up = true;
                                 return Err(crate::SurfaceError::Outdated);
                             }
                             log::warn!(
@@ -658,6 +712,9 @@ impl Swapchain for NativeSwapchain {
                     .map_err(map_host_device_oom_and_lost_err)?;
             }
             self.pending_acquire = None;
+            // A caller may answer `Outdated` by acquiring again, which resumes
+            // the acquire: one that completes is a swapchain that works.
+            self.given_up = false;
         }
 
         drop(acquire_semaphore_guard);

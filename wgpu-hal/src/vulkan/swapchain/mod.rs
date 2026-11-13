@@ -33,6 +33,11 @@ pub(super) trait Surface: Send + Sync + 'static {
     /// If this is not the first swapchain created for the surface, the old swapchain
     /// must be provided. [`Swapchain::release_resources`] must be called on the old swapchain
     /// before calling this method.
+    ///
+    /// The old swapchain is provided even when an acquire gave it up as outdated (see
+    /// [`Swapchain::acquire`]): such a swapchain is destroyed first and the new one made
+    /// from nothing, with no `oldSwapchain`, as the state that keeps its acquire fence
+    /// pending passes along `oldSwapchain` to the swapchain made from it.
     unsafe fn create_swapchain(
         &self,
         device: &super::Device,
