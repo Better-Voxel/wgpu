@@ -1,7 +1,7 @@
 //! Vulkan Surface and Swapchain implementation using native Vulkan surfaces.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::any::Any;
+use core::{any::Any, time::Duration};
 
 use ash::{khr, vk};
 use parking_lot::{Mutex, MutexGuard};
@@ -294,6 +294,8 @@ impl Surface for NativeSurface {
             device: Arc::clone(&device.shared),
             images,
             fence,
+            pending_acquire: None,
+            kept_for_pending_acquire: None,
             config: config.clone(),
             acquire_semaphores,
             next_acquire_index: 0,
@@ -312,6 +314,35 @@ impl Surface for NativeSurface {
     }
 }
 
+/// How long one [`Swapchain::acquire`] waits for the swapchain's acquire fence
+/// before it gives the swapchain up as outdated.
+///
+/// Long enough for a stalled compositor to hand the image back
+/// (https://github.com/gfx-rs/wgpu/issues/9029); short enough that a fence that
+/// never signals costs a hitch rather than a hang.
+const ACQUIRE_FENCE_BOUND: Duration = Duration::from_secs(3);
+
+/// The longest single wait on the swapchain's acquire fence; each one that
+/// times out is logged.
+const ACQUIRE_FENCE_SLICE: Duration = Duration::from_secs(1);
+
+/// An image [`vkAcquireNextImageKHR`] handed out whose acquire fence has not
+/// been seen signaled.
+///
+/// Until it is, the swapchain's fence and the acquire semaphore at
+/// [`NativeSwapchain::next_acquire_index`] belong to that acquire.
+///
+/// [`vkAcquireNextImageKHR`]: https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#vkAcquireNextImageKHR
+#[derive(Debug)]
+struct PendingAcquire {
+    /// The image's index, as the driver returned it.
+    index: u32,
+    /// Whether the driver answered `VK_SUBOPTIMAL_KHR`.
+    suboptimal: bool,
+    /// How long the fence has been waited for, over every call.
+    waited: Duration,
+}
+
 pub(crate) struct NativeSwapchain {
     raw: vk::SwapchainKHR,
     functor: khr::swapchain::Device,
@@ -319,6 +350,13 @@ pub(crate) struct NativeSwapchain {
     images: Vec<vk::Image>,
     /// Fence used to wait on the acquired image.
     fence: Option<vk::Fence>,
+    /// The acquire whose fence no call to [`Swapchain::acquire`] has seen
+    /// signaled yet; the next call resumes it.
+    pending_acquire: Option<PendingAcquire>,
+    /// The fence and the acquire semaphore an acquire still held when
+    /// [`Swapchain::release_resources`] ran, destroyed in `Drop` after the
+    /// swapchain.
+    kept_for_pending_acquire: Option<(vk::Fence, vk::Semaphore)>,
     config: crate::SurfaceConfiguration,
 
     /// Semaphores used between image acquisition and the first submission
@@ -372,6 +410,14 @@ impl Drop for NativeSwapchain {
         unsafe {
             self.functor.destroy_swapchain(self.raw, None);
         }
+        // What an acquire still held at `release_resources` outlives the
+        // swapchain it was acquired from; see there.
+        if let Some((fence, semaphore)) = self.kept_for_pending_acquire.take() {
+            unsafe {
+                self.device.raw.destroy_fence(fence, None);
+                self.device.raw.destroy_semaphore(semaphore, None);
+            }
+        }
     }
 }
 
@@ -392,7 +438,27 @@ impl Swapchain for NativeSwapchain {
         };
 
         if let Some(fence) = self.fence {
-            unsafe { device.shared.raw.destroy_fence(fence, None) }
+            if self.pending_acquire.is_some() {
+                // An acquire still pending holds the fence and its acquire
+                // semaphore: once the image is acquired their signal operations
+                // "are submitted for execution", and "Applications must not free
+                // or destroy any object while it is being accessed".
+                // `vkDeviceWaitIdle` above waits for queue work alone, and the
+                // destroy commands' own rules (VUID-vkDestroyFence-fence-01120,
+                // VUID-vkDestroySemaphore-semaphore-05149) name queue work only,
+                // so both are kept until the swapchain itself is destroyed, in
+                // `Drop`. The image needs nothing: no use of it was submitted
+                // (VUID-vkDestroySwapchainKHR-swapchain-01282: "All uses of
+                // presentable images acquired from swapchain must have completed
+                // execution").
+                let semaphore = self.acquire_semaphores.remove(self.next_acquire_index);
+                let semaphore = Arc::into_inner(semaphore)
+                    .expect("Trying to keep a SwapchainAcquireSemaphore that is still in use by a SurfaceTexture")
+                    .into_inner();
+                self.kept_for_pending_acquire = Some((fence, semaphore.acquire));
+            } else {
+                unsafe { device.shared.raw.destroy_fence(fence, None) }
+            }
         }
 
         // We cannot take this by value, as the function returns `self`.
@@ -417,7 +483,7 @@ impl Swapchain for NativeSwapchain {
 
     unsafe fn acquire(
         &mut self,
-        timeout: Option<core::time::Duration>,
+        timeout: Option<Duration>,
         fence: &crate::vulkan::Fence,
     ) -> Result<crate::AcquiredSurfaceTexture<crate::api::Vulkan>, crate::SurfaceError> {
         let mut timeout_ns = match timeout {
@@ -444,90 +510,133 @@ impl Swapchain for NativeSwapchain {
             .try_lock()
             .expect("Failed to lock a SwapchainSemaphores.");
 
-        // Wait for all commands writing to the previously acquired image to
-        // complete.
-        //
-        // Almost all the steps in the usual acquire-draw-present flow are
-        // asynchronous: they get something started on the presentation engine
-        // or the GPU, but on the CPU, control returns immediately. Without some
-        // sort of intervention, the CPU could crank out frames much faster than
-        // the presentation engine can display them.
-        //
-        // This is the intervention: if any submissions drew on this image, and
-        // thus waited for `locked_swapchain_semaphores.acquire`, wait for all
-        // of them to finish, thus ensuring that it's okay to pass `acquire` to
-        // `vkAcquireNextImageKHR` again.
-        let completed = self.device.wait_for_fence(
-            fence,
-            acquire_semaphore_guard.previously_used_submission_index,
-            timeout_ns,
-        )?;
-        if !completed {
-            return Err(crate::SurfaceError::Timeout);
-        }
-
-        let acquire_fence = self.fence.unwrap_or_else(vk::Fence::null);
-
-        // will block if no image is available
-        let (index, suboptimal) = match unsafe {
-            profiling::scope!("vkAcquireNextImageKHR");
-            self.functor.acquire_next_image(
-                self.raw,
+        let (index, suboptimal) = if let Some(pending) = &self.pending_acquire {
+            // A previous call was handed this image and returned before its
+            // fence was seen signaled: the acquire is resumed, never repeated, as
+            // its semaphore still has the acquire's signal operation pending
+            // (VUID-vkAcquireNextImageKHR-semaphore-01779: "If semaphore is not
+            // VK_NULL_HANDLE, it must not have any uncompleted signal or wait
+            // operations pending").
+            (pending.index, pending.suboptimal)
+        } else {
+            // Wait for all commands writing to the previously acquired image to
+            // complete.
+            //
+            // Almost all the steps in the usual acquire-draw-present flow are
+            // asynchronous: they get something started on the presentation engine
+            // or the GPU, but on the CPU, control returns immediately. Without some
+            // sort of intervention, the CPU could crank out frames much faster than
+            // the presentation engine can display them.
+            //
+            // This is the intervention: if any submissions drew on this image, and
+            // thus waited for `locked_swapchain_semaphores.acquire`, wait for all
+            // of them to finish, thus ensuring that it's okay to pass `acquire` to
+            // `vkAcquireNextImageKHR` again.
+            let completed = self.device.wait_for_fence(
+                fence,
+                acquire_semaphore_guard.previously_used_submission_index,
                 timeout_ns,
-                acquire_semaphore_guard.acquire,
-                acquire_fence,
-            )
-        } {
-            // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
-            // See the comment in `Queue::present`.
-            #[cfg(target_os = "android")]
-            Ok((index, _)) => (index, false),
-            #[cfg(not(target_os = "android"))]
-            Ok(pair) => pair,
-            Err(error) => {
-                return match error {
-                    vk::Result::TIMEOUT => Err(crate::SurfaceError::Timeout),
-                    vk::Result::NOT_READY | vk::Result::ERROR_OUT_OF_DATE_KHR => {
-                        Err(crate::SurfaceError::Outdated)
-                    }
-                    vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
-                    // We don't use VK_EXT_full_screen_exclusive
-                    // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
-                    other => Err(map_host_device_oom_and_lost_err(other).into()),
-                };
+            )?;
+            if !completed {
+                return Err(crate::SurfaceError::Timeout);
+            }
+
+            let acquire_fence = self.fence.unwrap_or_else(vk::Fence::null);
+
+            // will block if no image is available
+            match unsafe {
+                profiling::scope!("vkAcquireNextImageKHR");
+                self.functor.acquire_next_image(
+                    self.raw,
+                    timeout_ns,
+                    acquire_semaphore_guard.acquire,
+                    acquire_fence,
+                )
+            } {
+                // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
+                // See the comment in `Queue::present`.
+                #[cfg(target_os = "android")]
+                Ok((index, _)) => (index, false),
+                #[cfg(not(target_os = "android"))]
+                Ok(pair) => pair,
+                Err(error) => {
+                    return match error {
+                        vk::Result::TIMEOUT => Err(crate::SurfaceError::Timeout),
+                        vk::Result::NOT_READY | vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                            Err(crate::SurfaceError::Outdated)
+                        }
+                        vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
+                        // We don't use VK_EXT_full_screen_exclusive
+                        // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
+                        other => Err(map_host_device_oom_and_lost_err(other).into()),
+                    };
+                }
             }
         };
 
         if let Some(fence) = self.fence {
+            // Until its fence is seen signaled the acquire is pending: a call
+            // that returns before that leaves it for the next call to resume.
+            let pending = self.pending_acquire.get_or_insert(PendingAcquire {
+                index,
+                suboptimal,
+                waited: Duration::ZERO,
+            });
+            // Waited in slices of the caller's timeout, a second at most.
+            let slice = Duration::from_nanos(timeout_ns).min(ACQUIRE_FENCE_SLICE);
+            let mut waited = Duration::ZERO;
             unsafe {
                 // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
                 //
                 // A `VK_TIMEOUT` from this wait is not a device loss
                 // (https://github.com/gfx-rs/wgpu/issues/9029): the image is
-                // acquired and its fence is merely still pending — a stalled
-                // compositor holds it past the timeout on Windows. The only sound
-                // thing to do is to keep waiting; a device that is really gone
-                // answers `ERROR_DEVICE_LOST` here, which maps as before.
-                let mut waited_ns: u64 = 0;
+                // acquired and its fence is merely still pending. Past
+                // `ACQUIRE_FENCE_BOUND` of waiting in one call the swapchain is
+                // given up as outdated, which a caller answers by making it
+                // again; a device that is really gone answers
+                // `ERROR_DEVICE_LOST` here, which maps as before.
                 loop {
-                    match self.device.raw.wait_for_fences(&[fence], true, timeout_ns) {
+                    match self
+                        .device
+                        .raw
+                        .wait_for_fences(&[fence], true, slice.as_nanos() as u64)
+                    {
                         Ok(()) => break,
+                        // A caller that gives no time to wait is answered as a
+                        // timed-out acquire is; the acquire stays pending.
+                        Err(vk::Result::TIMEOUT) if slice.is_zero() => {
+                            return Err(crate::SurfaceError::Timeout);
+                        }
                         Err(vk::Result::TIMEOUT) => {
-                            waited_ns = waited_ns.saturating_add(timeout_ns);
+                            pending.waited += slice;
+                            waited += slice;
+                            if waited >= ACQUIRE_FENCE_BOUND {
+                                log::warn!(
+                                    "the swapchain's acquire fence is still pending after {} ms; giving the swapchain up as outdated",
+                                    pending.waited.as_millis()
+                                );
+                                return Err(crate::SurfaceError::Outdated);
+                            }
                             log::warn!(
                                 "the swapchain's acquire fence is still pending after {} ms; waiting on",
-                                waited_ns / 1_000_000
+                                pending.waited.as_millis()
                             );
                         }
                         Err(other) => return Err(map_host_device_oom_and_lost_err(other).into()),
                     }
                 }
 
+                // Reset before the acquire stops being pending: one whose reset
+                // fails is resumed with its fence still signaled, and no
+                // `vkAcquireNextImageKHR` is handed a signaled fence
+                // (VUID-vkAcquireNextImageKHR-fence-01287: "If fence is not
+                // VK_NULL_HANDLE, fence must be unsignaled").
                 self.device
                     .raw
                     .reset_fences(&[fence])
                     .map_err(map_host_device_oom_and_lost_err)?;
             }
+            self.pending_acquire = None;
         }
 
         drop(acquire_semaphore_guard);
